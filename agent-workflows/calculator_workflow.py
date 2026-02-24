@@ -2,11 +2,11 @@
 from langchain_ollama import ChatOllama
 from dotenv import load_dotenv
 
-load_dotenv()
 from langchain_core.tools import tool
-from langgraph.graph import StateGraph, START, END, MessagesState
+from langgraph.graph import StateGraph, START, MessagesState
 from langgraph.prebuilt import ToolNode, tools_condition
-from IPython.display import Image, display
+
+load_dotenv()
 
 
 # 1. Define the tools
@@ -65,6 +65,8 @@ for msg in response["messages"]:
 
 # Replace 'app' with your compiled graph variable
 try:
-    display(Image(app.get_graph().draw_mermaid_png()))
+    png_data = app.get_graph().draw_mermaid_png()
+    with open("./calculator_workflow.png", "wb") as f:
+        f.write(png_data)
 except Exception:
     pass # Ignore error in terminal environments
