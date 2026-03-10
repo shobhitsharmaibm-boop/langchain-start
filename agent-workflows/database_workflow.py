@@ -1,16 +1,17 @@
-import json
-import os
 import pandas as pd
 from dotenv import load_dotenv
-from typing import List, Dict, Any
-
 from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
 from langchain_community.utilities import SQLDatabase
 from langchain_ollama import ChatOllama
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langgraph.checkpoint.memory import InMemorySaver
+from langchain.agents.middleware import HumanInTheLoopMiddleware
+from langchain.agents import create_agent
 from langchain_core.tools import tool
 from langgraph.graph import StateGraph, START, END, MessagesState
 from langgraph.prebuilt import ToolNode, tools_condition
+from langgraph.types import Command
+import uuid
 
 from db_connection import get_mysql_connection as db_engine
 
@@ -21,8 +22,36 @@ db = SQLDatabase(db_engine())
 llm = ChatOllama(model="qwen2.5", temperature=0)
 # llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
 
-# --- CUSTOM TOOLS ---
+def parse_data_to_df(input_data) -> pd.DataFrame:
+    """Converts input data (list, dict, or string) into a pandas DataFrame.
+    Supports JSON and literal evaluation for string inputs."""
+    if isinstance(input_data, (list, dict)):
+        return pd.DataFrame(input_data)
+    elif isinstance(input_data, str):
+        try:
+            import json
+            return pd.DataFrame(json.loads(input_data))
+        except json.JSONDecodeError:
+            try:
+                import ast
+                return pd.DataFrame(ast.literal_eval(input_data))
+            except Exception:
+                raise ValueError(f"Could not parse string data. Data: {input_data[:100]}...")
+    raise TypeError(f"Unsupported data type {type(input_data)}.")
 
+# --- CUSTOM TOOLS ---
+@tool
+def convert_table_format_tool(data: str) -> str:
+    """
+    Converts data to table format.
+    """
+    try:
+        from tabulate import tabulate
+        df = parse_data_to_df(data)
+        return tabulate(df, headers="keys", tablefmt="grid", showindex=False)
+
+    except Exception as e:
+        return f"Error converting SQL to DataFrame: {e}"
 
 @tool
 def sql_execution_tool(query_intent: str) -> str:
@@ -62,7 +91,6 @@ def sql_execution_tool(query_intent: str) -> str:
 
     # 4. Execute
     try:
-        # print(f"Executing SQL: {generated_sql}")
         result = db.run(generated_sql)
         # Return as JSON string so it's easy for subsequent tools to parse
         return result
@@ -76,26 +104,7 @@ def generate_report_tool(data: str, filename: str = "report.xlsx") -> str:
     'data' can be a list of dictionaries or a JSON-formatted string.
     """
     try:
-        import ast
-        import json
-        
-        # If it's already a list or dict, use it directly
-        if isinstance(data, (list, dict)):
-            df = pd.DataFrame(data)
-        elif isinstance(data, str):
-            try:
-                # Try JSON first
-                parsed_data = json.loads(data)
-                df = pd.DataFrame(parsed_data)
-            except json.JSONDecodeError:
-                # Try literal_eval if it's a string representation of a list of tuples
-                try:
-                    parsed_data = ast.literal_eval(data)
-                    df = pd.DataFrame(parsed_data)
-                except Exception:
-                    return f"Error: Could not parse string data. Data: {data[:100]}..."
-        else:
-            return f"Error: Unsupported data type {type(data)}."
+        df = parse_data_to_df(data)
 
         if df.empty:
             return "No data found to generate report."
@@ -105,9 +114,6 @@ def generate_report_tool(data: str, filename: str = "report.xlsx") -> str:
     except Exception as e:
         return f"Error generating report: {e}"
 
-# --- LANGGRAPH SETUP ---
-tools = [sql_execution_tool, generate_report_tool]
-llm_with_tools = llm.bind_tools(tools)
 
 SYSTEM_PROMPT = """
 You are a helpful assistant for a school database.
@@ -117,108 +123,61 @@ You have access to:
    Input the EXACT string returned by `sql_execution_tool` into `generate_report_tool`.
 
 ALWAYS start with `sql_execution_tool` if the user asks a question about data.
-NOTE: Note that whatever data you show that should be in table format with proper columns and rows.
+
 """
 
-def call_model(state: MessagesState):
-    response = llm_with_tools.invoke(
-        [SystemMessage(content=SYSTEM_PROMPT)] + state["messages"]
+# --- LANGGRAPH SETUP ---
+tools = [sql_execution_tool, generate_report_tool, convert_table_format_tool]
+middleware = [
+    HumanInTheLoopMiddleware(
+        interrupt_on={
+            "generate_report_tool": True,
+            "sql_execution_tool": False,
+            "convert_table_format_tool": False
+        }
     )
-    return {"messages": [response]}
+]
+agent = create_agent(model=llm, tools=tools, system_prompt=SYSTEM_PROMPT, middleware=middleware)
 
-def human_approval_node(state: MessagesState):
-    """
-    Node that checks if we just finished sql_execution_tool and need approval for report.
-    """
-    last_message = state["messages"][-1]
-    human_message = state["messages"][0]
+def agent_node(state: MessagesState) -> MessagesState:
+    """LangGraph node calling your HITL agent."""
+    result = agent.invoke(state)
+    return {"messages": [AIMessage(content=result["output"])]}
 
-    # 2. Prompt to generate report generation question
-    prompt = f"""
-    You are a expert in identifying the user intent. Based on the following Human Message, generate a question wheather user want excel report or not.
-
-    Human Message:
-    {human_message.content}    
-    """
-
-    hitl_prompt = llm.invoke([HumanMessage(content=prompt)]).content.strip()
-    
-    # Check if the last tool executed was sql_execution_tool
-    if isinstance(last_message, ToolMessage) and last_message.name == "sql_execution_tool":
-        user_input = input(f"\n[HITL] {hitl_prompt}: ").lower().strip()
-        promt = f"""
-            You are a expert in identifying the user intent.
-            Based on the following User Concent, read the asked question by agent and generate a response either YES or NO
-
-            Question Asked by Agent:
-            {hitl_prompt}
-
-            User Concent:
-            {user_input}
-        """
-
-        human_approval_response = llm.invoke([HumanMessage(content=promt)]).content.strip()
-
-        if "yes" in human_approval_response.lower():
-            return {"messages": [HumanMessage(content="Yes, please generate an Excel report with this data.")]}
-        else:
-            return {"messages": [HumanMessage(content="No, I don't want a report. End the workflow.")]}
-    
-    return {}
-
-def route_after_agent(state: MessagesState):
-    """
-    Custom router to handle HITL logic.
-    """
-    # Standard tools_condition logic first
-    route = tools_condition(state)
-    if route == "tools":
-        # Check if the tool being called is sql_execution_tool
-        last_msg = state["messages"][-1]
-        if hasattr(last_msg, "tool_calls"):
-            tool_calls = last_msg.tool_calls
-            # If any tool call is sql_execution_tool, we go to tools normally
-            # The HITL logic will trigger AFTER tools node finishes
-            return "tools"
-    return route
-
-def route_after_tools(state: MessagesState):
-    """
-    Router after tools node execution.
-    """
-    last_message = state["messages"][-1]
-    if isinstance(last_message, ToolMessage) and last_message.name == "sql_execution_tool":
-        return "human_approval"
-    return "agent"
-
-def route_after_human(state: MessagesState):
-    """
-    Router after human input.
-    """
-    last_message = state["messages"][-1]
-    if "Yes, please generate" in last_message.content:
-        return "agent" # Let agent decide to call generate_report_tool
-    return "__end__"
 
 # Build the graph
 workflow = StateGraph(MessagesState)
-workflow.add_node("agent", call_model)
+workflow.add_node("agent", agent)
 workflow.add_node("tools", ToolNode(tools))
-workflow.add_node("human_approval", human_approval_node)
 
 workflow.add_edge(START, "agent")
-workflow.add_conditional_edges("agent", route_after_agent, {"tools": "tools", "__end__": END})
-workflow.add_conditional_edges("tools", route_after_tools, {"human_approval": "human_approval", "agent": "agent"})
-workflow.add_conditional_edges("human_approval", route_after_human, {"agent": "agent", "__end__": END})
+workflow.add_conditional_edges("agent", tools_condition)
 
-app = workflow.compile()
-query="Show me list of 10 students?"
+config = {"configurable": {"thread_id": str(uuid.uuid4())}}
+app = workflow.compile(checkpointer=InMemorySaver())
+query="Show me list of 10 students and generate report"
 
 
 # --- EXECUTION ---
 if __name__ == "__main__":
-    response = app.invoke({"messages": [HumanMessage(content=query)]})
-    print(response)
+    response = app.invoke(
+        input= {
+            "messages": [HumanMessage(content=query)]
+        },
+        config=config
+    )
+    print("Graph state:", response["messages"][-1].content)
+
+    if "__interrupt__" in response:
+        interrupt = response["__interrupt__"][0].value
+        print("Pending actions:", interrupt["action_requests"])
+        
+        # Human decision (one per action, same order)
+        response2 = app.invoke(
+            Command(resume={"decisions": [{"type": "approve"}]}),  # or "reject", "edit"
+            config=config
+        )
+        print("Final result:", response2["messages"][-1].content)
     
 # Show workflow
 try:
