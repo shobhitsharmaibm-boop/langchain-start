@@ -155,29 +155,43 @@ workflow.add_conditional_edges("agent", tools_condition)
 
 config = {"configurable": {"thread_id": str(uuid.uuid4())}}
 app = workflow.compile(checkpointer=InMemorySaver())
-query="Show me list of 10 students and generate report"
-
 
 # --- EXECUTION ---
 if __name__ == "__main__":
     response = app.invoke(
         input= {
-            "messages": [HumanMessage(content=query)]
+            "messages": [HumanMessage(content="Show me list of 10 students")]
         },
         config=config
     )
     print("Graph state:", response["messages"][-1].content)
 
-    if "__interrupt__" in response:
-        interrupt = response["__interrupt__"][0].value
+    n = app.invoke(
+        input= {
+            "messages": [HumanMessage(content="Add student class name as well in the student list")]
+        },
+        config=config
+    )
+    print("Graph state:", n["messages"][-1].content)
+
+    response2 = app.invoke(
+        input= {
+            "messages": [HumanMessage(content="Yes, generate excel report")]
+        },
+        config=config
+    )
+    print("Graph state:", response2["messages"][-1].content)
+
+    if "__interrupt__" in response2:
+        interrupt = response2["__interrupt__"][0].value
         print("Pending actions:", interrupt["action_requests"])
         
         # Human decision (one per action, same order)
-        response2 = app.invoke(
+        response3 = app.invoke(
             Command(resume={"decisions": [{"type": "approve"}]}),  # or "reject", "edit"
             config=config
         )
-        print("Final result:", response2["messages"][-1].content)
+        print("Final result:", response3["messages"][-1].content)
     
 # Show workflow
 try:
