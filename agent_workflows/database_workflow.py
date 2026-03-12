@@ -1,6 +1,11 @@
+import sys
+import os
+sys.path.append(os.getcwd())
+
+
 import pandas as pd
 from dotenv import load_dotenv
-from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
+from langchain_core.messages import HumanMessage, AIMessage
 from langchain_community.utilities import SQLDatabase
 from langchain_ollama import ChatOllama
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -19,8 +24,9 @@ load_dotenv()
 
 # 1. Initialize database (using SQLDatabase utility for convenience in schema/execution)
 db = SQLDatabase(db_engine())
-llm = ChatOllama(model="qwen2.5", temperature=0)
-# llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
+# llm = ChatOllama(model="qwen3.5", temperature=0)
+llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
+
 
 def parse_data_to_df(input_data) -> pd.DataFrame:
     """Converts input data (list, dict, or string) into a pandas DataFrame.
@@ -30,14 +36,19 @@ def parse_data_to_df(input_data) -> pd.DataFrame:
     elif isinstance(input_data, str):
         try:
             import json
+
             return pd.DataFrame(json.loads(input_data))
         except json.JSONDecodeError:
             try:
                 import ast
+
                 return pd.DataFrame(ast.literal_eval(input_data))
             except Exception:
-                raise ValueError(f"Could not parse string data. Data: {input_data[:100]}...")
+                raise ValueError(
+                    f"Could not parse string data. Data: {input_data[:100]}..."
+                )
     raise TypeError(f"Unsupported data type {type(input_data)}.")
+
 
 # --- CUSTOM TOOLS ---
 @tool
@@ -47,21 +58,23 @@ def convert_table_format_tool(data: str) -> str:
     """
     try:
         from tabulate import tabulate
+
         df = parse_data_to_df(data)
         return tabulate(df, headers="keys", tablefmt="grid", showindex=False)
 
     except Exception as e:
         return f"Error converting SQL to DataFrame: {e}"
 
+
 @tool
 def sql_execution_tool(query_intent: str) -> str:
     """
-    Given a user's natural language intent, fetches the schema, 
+    Given a user's natural language intent, fetches the schema,
     generates a safe SQL query, and executes it against the database.
     """
     # 1. Fetch Schema
     schema = db.get_table_info()
-    
+
     # 2. Prompt model to generate SQL based on schema
     prompt = f"""
     You are a MySQL expert. Based on the following schema, generate a valid MySQL SELECT query that fulfills the user's intent.
@@ -73,10 +86,10 @@ def sql_execution_tool(query_intent: str) -> str:
     USER INTENT:
     {query_intent}
     """
-    
+
     # We use the raw LLM here to get just the string
     generated_sql = llm.invoke([HumanMessage(content=prompt)]).content.strip()
-    
+
     # Remove markdown formatting if present
     if "```sql" in generated_sql:
         generated_sql = generated_sql.split("```sql")[1].split("```")[0].strip()
@@ -97,6 +110,7 @@ def sql_execution_tool(query_intent: str) -> str:
     except Exception as e:
         return f"Error executing SQL: {e}"
 
+
 @tool
 def generate_report_tool(data: str, filename: str = "report.xlsx") -> str:
     """
@@ -108,7 +122,7 @@ def generate_report_tool(data: str, filename: str = "report.xlsx") -> str:
 
         if df.empty:
             return "No data found to generate report."
-            
+
         df.to_excel(filename, index=False)
         return f"Report successfully generated and saved to {filename}."
     except Exception as e:
@@ -133,11 +147,14 @@ middleware = [
         interrupt_on={
             "generate_report_tool": True,
             "sql_execution_tool": False,
-            "convert_table_format_tool": False
+            "convert_table_format_tool": False,
         }
     )
 ]
-agent = create_agent(model=llm, tools=tools, system_prompt=SYSTEM_PROMPT, middleware=middleware)
+agent = create_agent(
+    model=llm, tools=tools, system_prompt=SYSTEM_PROMPT, middleware=middleware
+)
+
 
 def agent_node(state: MessagesState) -> MessagesState:
     """LangGraph node calling your HITL agent."""
@@ -159,44 +176,44 @@ app = workflow.compile(checkpointer=InMemorySaver())
 # --- EXECUTION ---
 if __name__ == "__main__":
     response = app.invoke(
-        input= {
-            "messages": [HumanMessage(content="Show me list of 10 students")]
-        },
-        config=config
+        input={"messages": [HumanMessage(content="Show me list of 10 students")]},
+        config=config,
     )
     print("Graph state:", response["messages"][-1].content)
 
     n = app.invoke(
-        input= {
-            "messages": [HumanMessage(content="Add student class name as well in the student list")]
+        input={
+            "messages": [
+                HumanMessage(
+                    content="Add student class name as well in the student list"
+                )
+            ]
         },
-        config=config
+        config=config,
     )
     print("Graph state:", n["messages"][-1].content)
 
     response2 = app.invoke(
-        input= {
-            "messages": [HumanMessage(content="Yes, generate excel report")]
-        },
-        config=config
+        input={"messages": [HumanMessage(content="Yes, generate excel report")]},
+        config=config,
     )
     print("Graph state:", response2["messages"][-1].content)
 
     if "__interrupt__" in response2:
         interrupt = response2["__interrupt__"][0].value
         print("Pending actions:", interrupt["action_requests"])
-        
+
         # Human decision (one per action, same order)
         response3 = app.invoke(
             Command(resume={"decisions": [{"type": "approve"}]}),  # or "reject", "edit"
-            config=config
+            config=config,
         )
         print("Final result:", response3["messages"][-1].content)
-    
+
 # Show workflow
 try:
     png_data = app.get_graph().draw_mermaid_png()
     with open("./database_workflow.png", "wb") as f:
         f.write(png_data)
 except Exception:
-    pass # Ignore error in terminal environments
+    pass  # Ignore error in terminal environments
