@@ -1,5 +1,6 @@
 import sys
 import os
+
 sys.path.append(os.getcwd())
 
 
@@ -175,6 +176,7 @@ app = workflow.compile(checkpointer=InMemorySaver())
 
 # --- EXECUTION ---
 if __name__ == "__main__":
+
     response = app.invoke(
         input={"messages": [HumanMessage(content="Show me list of 10 students")]},
         config=config,
