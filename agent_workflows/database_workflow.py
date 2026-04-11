@@ -33,22 +33,28 @@ def parse_data_to_df(input_data) -> pd.DataFrame:
     """Converts input data (list, dict, or string) into a pandas DataFrame.
     Supports JSON and literal evaluation for string inputs."""
     if isinstance(input_data, (list, dict)):
-        return pd.DataFrame(input_data)
+        df = pd.DataFrame(input_data)
     elif isinstance(input_data, str):
         try:
             import json
 
-            return pd.DataFrame(json.loads(input_data))
+            df = pd.DataFrame(json.loads(input_data))
         except json.JSONDecodeError:
             try:
                 import ast
 
-                return pd.DataFrame(ast.literal_eval(input_data))
-            except Exception:
+                df = pd.DataFrame(ast.literal_eval(input_data))
+            except (SyntaxError, ValueError) as e:
                 raise ValueError(
                     f"Could not parse string data. Data: {input_data[:100]}..."
-                )
-    raise TypeError(f"Unsupported data type {type(input_data)}.")
+                ) from e
+    else:
+        raise TypeError(f"Unsupported data type {type(input_data)}.")
+    
+    if df.empty:
+        raise ValueError("Resulting DataFrame is empty. No data to process.")
+    
+    return df
 
 
 # --- CUSTOM TOOLS ---
